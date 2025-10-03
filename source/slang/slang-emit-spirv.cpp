@@ -2331,10 +2331,33 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
 
                 auto moduleInst = inst->getModule()->getModuleInst();
-                if (!m_defaultDebugSource)
-                    m_defaultDebugSource = debugSource;
                 // Only create DebugCompilationUnit for non-included files
                 auto isIncludedFile = as<IRBoolLit>(debugSource->getIsIncludedFile())->getValue();
+                
+                // Always prefer main file over header files for m_defaultDebugSource
+                bool shouldSetAsDefault = false;
+                if (!m_defaultDebugSource)
+                {
+                    // First source encountered
+                    shouldSetAsDefault = true;
+                }
+                else if (debugSource->getSourceText())
+                {
+                    // Check if this source looks more like a main file than current default
+                    auto sourceText = debugSource->getSourceText();
+                    if (auto sourceTextLit = as<IRStringLit>(sourceText))
+                    {
+                        auto text = sourceTextLit->getStringSlice();
+                        // This source has main function - prefer it over current default
+                        if (text.indexOf("main(") != Index(-1) && text.indexOf("[shader(") != Index(-1))
+                        {
+                            shouldSetAsDefault = true;
+                        }
+                    }
+                }
+                
+                if (shouldSetAsDefault)
+                    m_defaultDebugSource = debugSource;
                 if (!m_mapIRInstToSpvDebugInst.containsKey(moduleInst) && !isIncludedFile)
                 {
                     IRBuilder builder(inst);
@@ -3974,11 +3997,58 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         auto varType = tryGetPointedToType(&builder, globalInst->getDataType());
         auto debugType = emitDebugType(varType);
 
-        // Use default debug source and line info similar to struct debug type emission
+        // Handle debug location for global variables, with special care for entry point parameters
+        // that may have incorrect debug locations pointing to included files
         auto loc = globalInst->findDecoration<IRDebugLocationDecoration>();
         IRInst* source = loc ? loc->getSource() : m_defaultDebugSource;
         IRInst* line = loc ? loc->getLine() : builder.getIntValue(builder.getUIntType(), 0);
         IRInst* col = loc ? loc->getCol() : line;
+        
+        // Apply targeted fix for entry point parameters only - these should point to main file
+        // Entry point parameters are conceptually part of the entry point function in the main file
+        auto name = getName(globalInst);
+        bool isEntryPointParameter = name.startsWith("input_") || name.startsWith("entryPointParam_");
+        
+        if (isEntryPointParameter && loc && loc->getSource())
+        {
+            // For entry point parameters, check if their debug location points to included file
+            // and if we have a main file debug source available, use that instead
+            auto currentDebugSource = as<IRDebugSource>(loc->getSource());
+            if (currentDebugSource && currentDebugSource->getSourceText())
+            {
+                if (auto sourceTextLit = as<IRStringLit>(currentDebugSource->getSourceText()))
+                {
+                    auto text = sourceTextLit->getStringSlice();
+                    // If current source looks like a header file (no main function)
+                    // and we have access to other debug sources, find the main file
+                    if (text.indexOf("main(") == Index(-1))
+                    {
+                        // Search for the main file debug source
+                        for (auto& pair : m_mapIRInstToSpvDebugInst)
+                        {
+                            if (auto mainDebugSource = as<IRDebugSource>(pair.key))
+                            {
+                                if (auto mainSourceText = mainDebugSource->getSourceText())
+                                {
+                                    if (auto mainSourceTextLit = as<IRStringLit>(mainSourceText))
+                                    {
+                                        auto mainText = mainSourceTextLit->getStringSlice();
+                                        if (mainText.indexOf("main(") != Index(-1) && mainText.indexOf("[shader(") != Index(-1))
+                                        {
+                                            // Found the main file - use it for entry point parameters
+                                            source = pair.value;
+                                            line = builder.getIntValue(builder.getUIntType(), 0);
+                                            col = line;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         emitOpDebugGlobalVariable(
             getSection(SpvLogicalSectionID::GlobalVariables),
