@@ -8,36 +8,10 @@
 #include "slang-ir.h"
 #include "slang-legalize-types.h"
 #include "slang-target-program.h"
+#include "slang-target.h"
 
 namespace Slang
 {
-
-namespace
-{
-// Helper to check if target uses bindless resource types
-bool isBindlessTarget(CodeGenTarget target)
-{
-    switch (target)
-    {
-    case CodeGenTarget::CPPSource:
-    case CodeGenTarget::HostCPPSource:
-    case CodeGenTarget::HostExecutable:
-    case CodeGenTarget::HostSharedLibrary:
-    case CodeGenTarget::HostHostCallable:
-    case CodeGenTarget::ShaderHostCallable:
-    case CodeGenTarget::ShaderSharedLibrary:
-    case CodeGenTarget::CUDASource:
-    case CodeGenTarget::CUDAHeader:
-    case CodeGenTarget::PTX:
-    case CodeGenTarget::Metal:
-    case CodeGenTarget::MetalLib:
-    case CodeGenTarget::MetalLibAssembly:
-        return true;
-    default:
-        return false;
-    }
-}
-} // anonymous namespace
 
 // This is a subpass of generics lowering IR transformation.
 // This pass generates packing/unpacking functions for `AnyValue`s,
@@ -167,7 +141,7 @@ struct AnyValueMarshallingContext
             IRInst* concreteTypedVar,
             bool isBindless,
             IRIntegerValue sizeInBytes) = 0;
-            
+
         void ensureOffsetAt4ByteBoundary()
         {
             if (intraFieldOffset)
@@ -332,26 +306,22 @@ struct AnyValueMarshallingContext
                 // - Non-bindless (HLSL, GLSL/SPIRV): uint2 (8 bytes)
                 // - Bindless (CUDA, CPU, Metal): same as T (variable size)
                 auto target = context->targetProgram->getOptionSet().getTarget();
-                bool bindless = isBindlessTarget(target);
-                
+                bool bindless = areResourceTypesBindlessOnTarget(target);
+
                 IRSizeAndAlignment sizeAndAlign;
                 auto result = getNaturalSizeAndAlignment(
                     context->targetProgram->getOptionSet(),
                     dataType,
                     &sizeAndAlign);
-                
+
                 IRIntegerValue size = 8; // Default to 8 bytes for non-bindless
                 if (SLANG_SUCCEEDED(result) && sizeAndAlign.size > 0)
                 {
                     size = sizeAndAlign.size;
                 }
-                
-                context->marshalDescriptorHandle(
-                    builder,
-                    dataType,
-                    concreteTypedVar,
-                    bindless,
-                    size);
+
+                context
+                    ->marshalDescriptorHandle(builder, dataType, concreteTypedVar, bindless, size);
                 break;
             }
         default:
@@ -604,7 +574,7 @@ struct AnyValueMarshallingContext
             IRIntegerValue sizeInBytes) override
         {
             ensureOffsetAt4ByteBoundary();
-            
+
             if (!isBindless)
             {
                 // Non-bindless targets: Use CastDescriptorHandleToUInt2
@@ -613,23 +583,23 @@ struct AnyValueMarshallingContext
                 {
                     auto srcVal = builder->emitLoad(concreteVar);
                     auto uint2Type = builder->getVectorType(builder->getUIntType(), 2);
-                    
+
                     // Use the explicit IR cast op instead of bitcast
                     auto uint2Val = builder->emitIntrinsicInst(
                         uint2Type,
                         kIROp_CastDescriptorHandleToUInt2,
                         1,
                         &srcVal);
-                    
+
                     auto lowBits = builder->emitElementExtract(uint2Val, IRIntegerValue(0));
                     auto highBits = builder->emitElementExtract(uint2Val, IRIntegerValue(1));
-                    
+
                     auto dstAddr1 = builder->emitFieldAddress(
                         uintPtrType,
                         anyValueVar,
                         anyValInfo->fieldKeys[fieldOffset]);
                     builder->emitStore(dstAddr1, lowBits);
-                    
+
                     auto dstAddr2 = builder->emitFieldAddress(
                         uintPtrType,
                         anyValueVar,
@@ -643,9 +613,9 @@ struct AnyValueMarshallingContext
                 // Bindless targets (CUDA, CPU, Metal): DescriptorHandle is a native type
                 // Marshal as raw bytes based on actual size
                 SLANG_UNUSED(dataType);
-                
+
                 auto numFields = (sizeInBytes + 3) / 4;
-                
+
                 // For bindless targets, we can use bitcast since the type is native
                 auto srcVal = builder->emitLoad(concreteVar);
                 auto uintType = builder->getUIntType();
@@ -653,7 +623,7 @@ struct AnyValueMarshallingContext
                     uintType,
                     builder->getIntValue(builder->getIntType(), numFields));
                 auto srcBitcast = builder->emitBitCast(uintArrayType, srcVal);
-                
+
                 for (IRIntegerValue i = 0; i < numFields; i++)
                 {
                     if (fieldOffset < static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
@@ -669,7 +639,6 @@ struct AnyValueMarshallingContext
                 }
             }
         }
-
     };
 
     IRFunc* generatePackingFunc(IRType* type, IRAnyValueType* anyValueType)
@@ -949,7 +918,7 @@ struct AnyValueMarshallingContext
             IRIntegerValue sizeInBytes) override
         {
             ensureOffsetAt4ByteBoundary();
-            
+
             if (!isBindless)
             {
                 // Non-bindless targets: Use CastUInt2ToDescriptorHandle
@@ -960,25 +929,25 @@ struct AnyValueMarshallingContext
                         anyValueVar,
                         anyValInfo->fieldKeys[fieldOffset]);
                     auto lowBits = builder->emitLoad(srcAddr);
-                    
+
                     auto srcAddr1 = builder->emitFieldAddress(
                         uintPtrType,
                         anyValueVar,
                         anyValInfo->fieldKeys[fieldOffset + 1]);
                     auto highBits = builder->emitLoad(srcAddr1);
-                    
+
                     // Build uint2 from components
                     auto uint2Type = builder->getVectorType(builder->getUIntType(), 2);
                     IRInst* components[2] = {lowBits, highBits};
                     auto uint2Val = builder->emitMakeVector(uint2Type, 2, components);
-                    
+
                     // Use the explicit IR cast op instead of bitcast
                     auto result = builder->emitIntrinsicInst(
                         dataType,
                         kIROp_CastUInt2ToDescriptorHandle,
                         1,
                         &uint2Val);
-                    
+
                     builder->emitStore(concreteVar, result);
                 }
                 advanceOffset(8);
@@ -988,15 +957,15 @@ struct AnyValueMarshallingContext
                 // Bindless targets (CUDA, CPU, Metal): DescriptorHandle is a native type
                 // Unmarshal from raw bytes based on actual size
                 auto numFields = (sizeInBytes + 3) / 4;
-                
+
                 auto uintType = builder->getUIntType();
                 auto uintArrayType = builder->getArrayType(
                     uintType,
                     builder->getIntValue(builder->getIntType(), numFields));
-                
+
                 // Create a temporary variable to hold the uint32 array
                 auto tempVar = builder->emitVar(uintArrayType);
-                
+
                 // Read each uint32 field from anyValue into the temp array
                 for (IRIntegerValue i = 0; i < numFields; i++)
                 {
@@ -1014,7 +983,7 @@ struct AnyValueMarshallingContext
                     }
                     advanceOffset(4);
                 }
-                
+
                 // Bitcast the uint32 array to the target type
                 auto tempVal = builder->emitLoad(tempVar);
                 auto result = builder->emitBitCast(dataType, tempVal);
